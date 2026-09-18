@@ -63,6 +63,256 @@ jobs:
           name: aarch64-pc-windows-msvc
           path: dxc/build-aarch64/Release/bin/dxcompiler.*
 
+      # ---- Static build: prove Microsoft DXC can build a statically linkable dxcompiler ----
+      # Pipeline: Microsoft DXC @ pinned commit -> minimal in-place edits -> CMake -> static dxcompiler.lib
+      # The edits only make the dxcompiler target type configurable (DXC_BUILD_SHARED, default ON keeps the
+      # upstream shared behavior), remove dllimport semantics for static consumers (DXC_STATIC_BUILD) and add
+      # a standalone smoke test executable that links dxcompiler.lib directly. No source fork, no copied tree.
+      - name: Patch DXC (configurable static/shared dxcompiler target)
+        shell: bash
+        working-directory: dxc
+        run: |
+          python - <<'PYEOF'
+          import pathlib
+
+          def sub(path, old, new):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              assert s.count(old) == 1, "anchor not found in %s" % path
+              with open(p, "w", newline="") as f:
+                  f.write(s.replace(old, new))
+
+          # 1) dxcompiler target type: configurable SHARED (default = upstream behavior) / STATIC
+          sub("tools/clang/tools/dxcompiler/CMakeLists.txt",
+          """add_clang_library(dxcompiler SHARED ${SOURCES})""",
+          """option(DXC_BUILD_SHARED
+            "Build dxcompiler as a shared library (DLL/shared object). OFF builds a static library."
+            ON)
+          option(DXC_BUILD_STATIC_SMOKE_TEST
+            "Build a standalone executable linking the static dxcompiler library (requires DXC_BUILD_SHARED=OFF)."
+            OFF)
+
+          if (DXC_BUILD_SHARED)
+            add_clang_library(dxcompiler SHARED ${SOURCES})
+          else()
+            add_clang_library(dxcompiler STATIC ${SOURCES})
+            # Static consumers must not use dllimport semantics; see dxcapi.h.
+            target_compile_definitions(dxcompiler PRIVATE DXC_STATIC_BUILD)
+          endif()""")
+
+          # 2) append optional smoke-test target that links the static library
+          p = pathlib.Path("tools/clang/tools/dxcompiler/CMakeLists.txt")
+          s = p.read_text()
+          s += """
+          if (DXC_BUILD_STATIC_SMOKE_TEST)
+            if (DXC_BUILD_SHARED)
+              message(FATAL_ERROR "DXC_BUILD_STATIC_SMOKE_TEST requires DXC_BUILD_SHARED=OFF")
+            endif()
+            add_executable(dxcompiler-smoke-test smoke_test.cpp)
+            target_compile_definitions(dxcompiler-smoke-test PRIVATE DXC_STATIC_BUILD)
+            target_link_libraries(dxcompiler-smoke-test PRIVATE dxcompiler)
+          endif()
+          """
+          with open(p, "w", newline="") as f:
+              f.write(s)
+
+          # 3) dxcapi.cpp: dllexport only when building the shared library
+          sub("tools/clang/tools/dxcompiler/dxcapi.cpp",
+          """#ifdef _WIN32
+          #define DXC_API_IMPORT __declspec(dllexport)
+          #else
+          #define DXC_API_IMPORT __attribute__((visibility("default")))
+          #endif""",
+          """#if defined(_WIN32) && !defined(DXC_STATIC_BUILD)
+          #define DXC_API_IMPORT __declspec(dllexport)
+          #elif defined(_WIN32)
+          #define DXC_API_IMPORT
+          #else
+          #define DXC_API_IMPORT __attribute__((visibility("default")))
+          #endif""")
+
+          # 4) dxcapi.h: static consumers opt out of dllimport semantics
+          sub("include/dxc/dxcapi.h",
+          """#ifndef __DXC_API__
+          #define __DXC_API__""",
+          """#ifndef __DXC_API__
+          #define __DXC_API__
+
+          // Consumers linking against a static dxcompiler library must not apply
+          // dllimport semantics. Define DXC_STATIC_BUILD when using static dxcompiler.
+          #if defined(DXC_STATIC_BUILD) && !defined(DXC_API_IMPORT)
+          #define DXC_API_IMPORT
+          #endif""")
+          print("DXC patched for static build: OK")
+          PYEOF
+          cat > tools/clang/tools/dxcompiler/smoke_test.cpp <<'CPPEOF'
+          ///////////////////////////////////////////////////////////////////////////////
+          // smoke_test.cpp
+          //
+          // Standalone verification that the statically linked dxcompiler library
+          // works end to end without dxcompiler.dll:
+          //   1. calls DxcCreateInstance / DxcCreateInstance2 directly,
+          //   2. creates IDxcUtils and IDxcCompiler3,
+          //   3. compiles a minimal HLSL pixel shader to a DXIL container.
+          //
+          // Phase 1 target: x86_64-pc-windows-msvc.
+          ///////////////////////////////////////////////////////////////////////////////
+
+          #ifdef _WIN32
+
+          #include <windows.h>
+
+          #include <cstdio>
+          #include <cstring>
+
+          #include "dxc/dxcapi.h"
+
+          namespace {
+
+          const char kShaderSource[] =
+              "float4 main(float4 pos : SV_Position) : SV_Target\n"
+              "{\n"
+              "  return float4(1, 0, 0, 1);\n"
+              "}\n";
+
+          const char kDxbcMagic[4] = {'D', 'X', 'B', 'C'};
+
+          } // namespace
+
+          int main() {
+            HRESULT hr;
+
+            // 1. DxcCreateInstance must resolve against the static library itself.
+            IDxcUtils *pUtils = nullptr;
+            hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&pUtils));
+            if (FAILED(hr)) {
+              fprintf(stderr, "FAIL: DxcCreateInstance(CLSID_DxcUtils) -> 0x%08lX\n",
+                      static_cast<unsigned long>(hr));
+              return 1;
+            }
+            printf("OK: DxcCreateInstance(CLSID_DxcUtils)\n");
+
+            // 2. DxcCreateInstance2 with the process default allocator must work too.
+            IDxcCompiler3 *pCompiler = nullptr;
+            hr = DxcCreateInstance2(nullptr, CLSID_DxcCompiler,
+                                    IID_PPV_ARGS(&pCompiler));
+            if (FAILED(hr)) {
+              fprintf(stderr, "FAIL: DxcCreateInstance2(CLSID_DxcCompiler) -> 0x%08lX\n",
+                      static_cast<unsigned long>(hr));
+              return 1;
+            }
+            printf("OK: DxcCreateInstance2(CLSID_DxcCompiler)\n");
+
+            // 3. Compile a minimal HLSL pixel shader to DXIL.
+            DxcBuffer source = {};
+            source.Ptr = kShaderSource;
+            source.Size = sizeof(kShaderSource) - 1;
+            source.Encoding = DXC_CP_ACP;
+
+            const wchar_t *pArgs[] = {L"-T", L"ps_6_0"};
+            IDxcResult *pResult = nullptr;
+            hr = pCompiler->Compile(&source, pArgs, _countof(pArgs), nullptr,
+                                    IID_PPV_ARGS(&pResult));
+            if (FAILED(hr)) {
+              fprintf(stderr, "FAIL: IDxcCompiler3::Compile -> 0x%08lX\n",
+                      static_cast<unsigned long>(hr));
+              return 1;
+            }
+
+            HRESULT status = E_FAIL;
+            hr = pResult->GetStatus(&status);
+            if (FAILED(hr) || FAILED(status)) {
+              IDxcBlobWide *pErrors = nullptr;
+              pResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&pErrors), nullptr);
+              if (pErrors != nullptr && pErrors->GetStringLength() > 0) {
+                fwprintf(stderr, L"compiler output:\n%ls\n", pErrors->GetStringPointer());
+              } else {
+                fprintf(stderr, "FAIL: compile status 0x%08lX (no error blob)\n",
+                        static_cast<unsigned long>(status));
+              }
+              return 1;
+            }
+            printf("OK: IDxcCompiler3::Compile succeeded\n");
+
+            IDxcBlob *pShader = nullptr;
+            hr = pResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&pShader), nullptr);
+            if (FAILED(hr) || pShader == nullptr || pShader->GetBufferSize() < 4) {
+              fprintf(stderr, "FAIL: no shader object blob -> 0x%08lX\n",
+                      static_cast<unsigned long>(hr));
+              return 1;
+            }
+
+            if (memcmp(pShader->GetBufferPointer(), kDxbcMagic, sizeof(kDxbcMagic)) != 0) {
+              fprintf(stderr, "FAIL: output is not a DXBC container\n");
+              return 1;
+            }
+            printf("OK: HLSL compiled to DXIL (%zu bytes)\n",
+                   static_cast<size_t>(pShader->GetBufferSize()));
+
+            pShader->Release();
+            pResult->Release();
+            pCompiler->Release();
+            pUtils->Release();
+
+            printf("PASS: static dxcompiler works without dxcompiler.dll\n");
+            return 0;
+          }
+
+          #else // _WIN32
+
+          #include <cstdio>
+
+          int main() {
+            printf("SKIP: static smoke test is Windows-only in phase 1\n");
+            return 0;
+          }
+
+          #endif // _WIN32
+          CPPEOF
+
+      - name: Configure static dxcompiler build
+        run: >
+          cmake -Bbuild-static -G "Visual Studio 18 2026" -C cmake/caches/PredefinedParams.cmake -DSPIRV_BUILD_TESTS=OFF
+          -DLLVM_ENABLE_WERROR=OFF
+          -DHLSL_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DCLANG_INCLUDE_TESTS=OFF
+          -DDXC_BUILD_SHARED=OFF
+          -DBUILD_SHARED_LIBS=OFF
+          -DDXC_BUILD_STATIC_SMOKE_TEST=ON
+        working-directory: dxc
+
+      - name: Build static dxcompiler and smoke test
+        run: cmake --build dxc/build-static --config Release --target dxcompiler dxcompiler-smoke-test
+
+      # Standalone verification: the exe links dxcompiler.lib directly and must run
+      # without any dxcompiler.dll present anywhere on the runner.
+      - name: Run static dxcompiler smoke test
+        run: dxc/build-static/Release/bin/dxcompiler-smoke-test.exe
+
+      - name: Verify smoke test has no dxcompiler.dll dependency
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          Write-Host "Using dumpbin: $dumpbin"
+          $deps = (& $dumpbin /DEPENDENTS dxc\build-static\Release\bin\dxcompiler-smoke-test.exe) -join "`n"
+          Write-Host $deps
+          if ($deps -match 'dxcompiler\.dll') {
+            throw "FAIL: smoke test executable still imports dxcompiler.dll"
+          }
+          Write-Host "OK: dxcompiler-smoke-test.exe has no dxcompiler.dll dependency"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: x86_64-pc-windows-msvc-static
+          path: |
+            dxc/build-static/Release/lib/dxcompiler.lib
+            dxc/build-static/Release/lib/dxcompiler.pdb
+            dxc/build-static/Release/bin/dxcompiler-smoke-test.exe
+            dxc/include/dxc/dxcapi.h
+
   merge:
     runs-on: ubuntu-latest
     needs:
