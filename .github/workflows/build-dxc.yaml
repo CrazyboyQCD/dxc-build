@@ -293,7 +293,12 @@ jobs:
       # Standalone verification: the exe links dxcompiler.lib directly and must run
       # without any dxcompiler.dll present anywhere on the runner.
       - name: Run static dxcompiler smoke test
-        run: dxc/build-static/Release/bin/dxcompiler-smoke-test.exe
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem -Recurse dxc\build-static -Filter dxcompiler-smoke-test.exe | Select-Object -First 1).FullName
+          if (-not $exe) { throw "smoke test exe not found under build-static" }
+          Write-Host "Running: $exe"
+          & $exe
 
       - name: Verify smoke test has no dxcompiler.dll dependency
         shell: pwsh
@@ -302,7 +307,9 @@ jobs:
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           $dumpbin = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
           Write-Host "Using dumpbin: $dumpbin"
-          $deps = (& $dumpbin /DEPENDENTS dxc\build-static\Release\bin\dxcompiler-smoke-test.exe) -join "`n"
+          $exe = (Get-ChildItem -Recurse dxc\build-static -Filter dxcompiler-smoke-test.exe | Select-Object -First 1).FullName
+          if (-not $exe) { throw "smoke test exe not found under build-static" }
+          $deps = (& $dumpbin /DEPENDENTS $exe) -join "`n"
           Write-Host $deps
           if ($deps -match 'dxcompiler\.dll') {
             throw "FAIL: smoke test executable still imports dxcompiler.dll"
@@ -313,9 +320,9 @@ jobs:
         with:
           name: x86_64-pc-windows-msvc-static
           path: |
-            dxc/build-static/Release/lib/dxcompiler.lib
-            dxc/build-static/Release/lib/dxcompiler.pdb
-            dxc/build-static/Release/bin/dxcompiler-smoke-test.exe
+            dxc/build-static/**/dxcompiler.lib
+            dxc/build-static/**/dxcompiler.pdb
+            dxc/build-static/**/dxcompiler-smoke-test.exe
             dxc/include/dxc/dxcapi.h
 
   merge:
