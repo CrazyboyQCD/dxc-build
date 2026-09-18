@@ -1,33 +1,34 @@
 name: Build DXC
 on: [push]
 jobs:
-  build-dxc-macos:
-    runs-on: macos-15-xlarge
-    steps:
-      - uses: actions/checkout@v6
-      - run: git clone https://github.com/microsoft/DirectXShaderCompiler.git dxc --revision=$(cat commit-hash) --recurse-submodules
-      - run: cmake -Bbuild -GNinja -C cmake/caches/PredefinedParams.cmake -DSPIRV_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_WERROR=OFF
-        working-directory: dxc
-      - run: cmake --build dxc/build -t dxcompiler
-      - uses: actions/upload-artifact@v6
-        with:
-          # name: aarch64-apple-darwin
-          name: universal-apple-darwin
-          path: dxc/build/lib/libdxcompiler.dylib
-  build-dxc-linux:
-    # runs-on: linux-hosted-runner
-    runs-on: ubuntu-22.04 # For older GLIBC, the "hosted runner" above has Ubuntu 24.04 whose compiled binaries require glibc 2.38.
-    steps:
-      - run: sudo apt-get install -y ninja-build
-      - uses: actions/checkout@v6
-      - run: git clone https://github.com/microsoft/DirectXShaderCompiler.git dxc --revision=$(cat commit-hash) --recurse-submodules
-      - run: cmake -Bbuild -GNinja -C cmake/caches/PredefinedParams.cmake -DSPIRV_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_WERROR=OFF
-        working-directory: dxc
-      - run: cmake --build dxc/build -t dxcompiler
-      - uses: actions/upload-artifact@v6
-        with:
-          name: x86_64-unknown-linux-gnu
-          path: dxc/build/lib/libdxcompiler.so
+  # --- macOS / Linux disabled for phase 1 (Windows-only verification) ---
+  # build-dxc-macos:
+  #   runs-on: macos-15-xlarge
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - run: git clone https://github.com/microsoft/DirectXShaderCompiler.git dxc --revision=$(cat commit-hash) --recurse-submodules
+  #     - run: cmake -Bbuild -GNinja -C cmake/caches/PredefinedParams.cmake -DSPIRV_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_WERROR=OFF
+  #       working-directory: dxc
+  #     - run: cmake --build dxc/build -t dxcompiler
+  #     - uses: actions/upload-artifact@v6
+  #       with:
+  #         # name: aarch64-apple-darwin
+  #         name: universal-apple-darwin
+  #         path: dxc/build/lib/libdxcompiler.dylib
+  # build-dxc-linux:
+  #   # runs-on: linux-hosted-runner
+  #   runs-on: ubuntu-22.04 # For older GLIBC, the "hosted runner" above has Ubuntu 24.04 whose compiled binaries require glibc 2.38.
+  #   steps:
+  #     - run: sudo apt-get install -y ninja-build
+  #     - uses: actions/checkout@v6
+  #     - run: git clone https://github.com/microsoft/DirectXShaderCompiler.git dxc --revision=$(cat commit-hash) --recurse-submodules
+  #     - run: cmake -Bbuild -GNinja -C cmake/caches/PredefinedParams.cmake -DSPIRV_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_WERROR=OFF
+  #       working-directory: dxc
+  #     - run: cmake --build dxc/build -t dxcompiler
+  #     - uses: actions/upload-artifact@v6
+  #       with:
+  #         name: x86_64-unknown-linux-gnu
+  #         path: dxc/build/lib/libdxcompiler.so
   build-dxc-windows:
     # runs-on: windows-large-runner
     runs-on: windows-2025
@@ -85,7 +86,11 @@ jobs:
           # 1) dxcompiler target type: configurable SHARED (default = upstream behavior) / STATIC
           sub("tools/clang/tools/dxcompiler/CMakeLists.txt",
           """add_clang_library(dxcompiler SHARED ${SOURCES})""",
-          """option(DXC_BUILD_SHARED
+          """# smoke_test.cpp is a standalone executable, not part of the dxcompiler
+          # library sources; exclude it from DXC's strict source-file list check.
+          list(APPEND HLSL_IGNORE_SOURCES smoke_test.cpp)
+
+          option(DXC_BUILD_SHARED
             "Build dxcompiler as a shared library (DLL/shared object). OFF builds a static library."
             ON)
           option(DXC_BUILD_STATIC_SMOKE_TEST
@@ -316,8 +321,6 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs:
-      - build-dxc-macos
-      - build-dxc-linux
       - build-dxc-windows
     steps:
       - name: Merge Artifacts
