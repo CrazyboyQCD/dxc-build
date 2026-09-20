@@ -361,13 +361,47 @@ jobs:
           }
           Write-Host "OK: dxcompiler-smoke-test.exe has no dxcompiler.dll dependency"
 
+      # Callers don't want dozens of LLVM/Clang .lib files: merge the whole
+      # static-link closure into one self-contained dxcompiler.lib (lib.exe
+      # merges obj sets, so circular dependencies are a non-issue).
+      - name: Merge static link closure into a single dxcompiler.lib
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $libexe = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -First 1).FullName
+          $libs = Get-ChildItem -Recurse dxc\build-static -Filter *.lib | Where-Object { $_.Name -notmatch 'smoke' } | ForEach-Object { $_.FullName }
+          Write-Host "Merging $($libs.Count) static libraries"
+          $libs | Set-Content dxc\merge.rsp
+          & $libexe /NOLOGO /OUT:dxc\build-static\dxcompiler.lib "@dxc\merge.rsp"
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe merge failed" }
+          Get-Item dxc\build-static\dxcompiler.lib | Select-Object Name, Length
+
+      # Caller-perspective proof: build the smoke test with a bare cl against
+      # ONLY the merged single lib + dxcapi.h, then run it.
+      - name: Verify single-lib standalone link and run
+        shell: pwsh
+        working-directory: dxc
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = "$vsPath\VC\Auxiliary\Build\vcvars64.bat"
+          cmd /s /c "`"$vcvars`" && cl /nologo /EHsc /MD -DDXC_STATIC_BUILD /I include tools\clang\tools\dxcompiler\smoke_test.cpp /Fe:direct-link-test.exe /link build-static\dxcompiler.lib"
+          if ($LASTEXITCODE -ne 0) { throw "standalone cl link against single dxcompiler.lib failed" }
+          $dumpbin = (Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          $deps = (& $dumpbin /DEPENDENTS .\direct-link-test.exe) -join "`n"
+          Write-Host $deps
+          if ($deps -match 'dxcompiler\.dll') { throw "FAIL: direct-link test imports dxcompiler.dll" }
+          & .\direct-link-test.exe
+          if ($LASTEXITCODE -ne 0) { throw "direct-link smoke test failed" }
+
       - uses: actions/upload-artifact@v6
         with:
           name: x86_64-pc-windows-msvc-static
           path: |
-            dxc/build-static/**/dxcompiler.lib
+            dxc/build-static/dxcompiler.lib
             dxc/build-static/**/dxcompiler.pdb
-            dxc/build-static/**/dxcompiler-smoke-test.exe
+            dxc/direct-link-test.exe
             dxc/include/dxc/dxcapi.h
 
   merge:
