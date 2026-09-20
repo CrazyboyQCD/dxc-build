@@ -148,6 +148,51 @@ jobs:
           #if defined(DXC_STATIC_BUILD) && !defined(DXC_API_IMPORT)
           #define DXC_API_IMPORT
           #endif""")
+
+          # 5) DXCompiler.cpp: no DllMain runs for a static library on Windows.
+          #    Mirror the Unix constructor/destructor bootstrap so DxcCreateInstance
+          #    works right after linking, without extra consumer initialization.
+          sub("tools/clang/tools/dxcompiler/DXCompiler.cpp",
+          """    DxcEtw_DXCompilerShutdown_Stop(S_OK);
+              EventUnregisterMicrosoft_Windows_DXCompiler_API();
+            }
+
+              return result;
+          }""",
+          """    DxcEtw_DXCompilerShutdown_Stop(S_OK);
+              EventUnregisterMicrosoft_Windows_DXCompiler_API();
+            }
+
+              return result;
+          }
+
+          #if defined(DXC_STATIC_BUILD)
+          // When dxcompiler is linked as a static library, no DllMain runs on Windows.
+          // Mirror the Unix constructor/destructor so DxcCreateInstance works directly
+          // after linking, without any extra initialization calls from the consumer.
+          namespace {
+          struct DxcStaticBootstrap {
+            DxcStaticBootstrap() {
+              EventRegisterMicrosoft_Windows_DXCompiler_API();
+              DxcEtw_DXCompilerInitialization_Start();
+              HRESULT hr = InitMaybeFail();
+              DxcEtw_DXCompilerInitialization_Stop(hr);
+            }
+            ~DxcStaticBootstrap() {
+              DxcSetThreadMallocToDefault();
+              ::hlsl::options::cleanupHlslOptTable();
+              ::llvm::sys::fs::CleanupPerThreadFileSystem();
+              ::llvm::llvm_shutdown();
+              DxilLibCleanup(DxilLibCleanUpType::ProcessTermination);
+              DxcClearThreadMalloc();
+              DxcCleanupThreadMalloc();
+              EventUnregisterMicrosoft_Windows_DXCompiler_API();
+            }
+          };
+          static DxcStaticBootstrap g_DxcStaticBootstrap;
+          } // namespace
+          #endif // DXC_STATIC_BUILD""")
+
           print("DXC patched for static build: OK")
           PYEOF
           cat > tools/clang/tools/dxcompiler/smoke_test.cpp <<'CPPEOF'
